@@ -363,12 +363,15 @@ func (s *Server) ListEvaluationResults(
 	// Do the final sort of all the data
 	entities, profileStatuses, statusByEntity, err := s.sortEntitiesEvaluationStatus(
 		ctx, s.store, profileList, profileStatusList, rtIndex, entIdIndex, entTypeIndex,
+		in.GetIncludeOutputs(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("sorting rule evaluations: %w", err)
 	}
 
-	return buildListEvaluationResponse(entities, profileStatuses, statusByEntity), nil
+	resp := buildListEvaluationResponse(entities, profileStatuses, statusByEntity)
+
+	return resp, nil
 }
 
 // sortEntitiesEvaluationStatus queries the database from the filtered lists
@@ -382,6 +385,7 @@ func (s *Server) sortEntitiesEvaluationStatus(
 	profileList []db.ListProfilesByProjectIDAndLabelRow,
 	profileStatusList map[uuid.UUID]db.GetProfileStatusByProjectRow,
 	rtIndex, entIdIndex, entTypeIndex map[string]struct{},
+	includeOutputs bool,
 ) (
 	entities map[string]*minderv1.EntityTypedId,
 	profileStatuses map[uuid.UUID]*minderv1.ProfileStatus,
@@ -399,7 +403,10 @@ func (s *Server) sortEntitiesEvaluationStatus(
 
 	for _, p := range profileList {
 		evals, err := store.ListRuleEvaluationsByProfileId(
-			ctx, db.ListRuleEvaluationsByProfileIdParams{ProfileID: p.Profile.ID},
+			ctx, db.ListRuleEvaluationsByProfileIdParams{
+				ProfileID:      p.Profile.ID,
+				IncludeOutputs: includeOutputs,
+			},
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -452,7 +459,7 @@ func (s *Server) sortEntitiesEvaluationStatus(
 				profileStatuses[p.Profile.ID] = buildProfileStatus(&p, profileStatusList)
 			}
 
-			stat, err := s.buildRuleEvaluationStatusFromDBEvaluation(ctx, &p, e, efp)
+			stat, err := s.buildRuleEvaluationStatusFromDBEvaluation(ctx, &p, e, efp, includeOutputs)
 			if err != nil {
 				// A failure parsing the PR metadata points to a corrupt record. Log but don't err.
 				zerolog.Ctx(ctx).Error().Err(err).Msg("error building rule evaluation status")
@@ -602,6 +609,7 @@ func (s *Server) buildRuleEvaluationStatusFromDBEvaluation(
 	ctx context.Context,
 	profile *db.ListProfilesByProjectIDAndLabelRow, eval db.ListRuleEvaluationsByProfileIdRow,
 	efp *entmodels.EntityWithProperties,
+	includeOutputs bool,
 ) (*minderv1.RuleEvaluationStatus, error) {
 	guidance := ""
 	// Only return the rule type guidance text when there is a problem
@@ -689,6 +697,13 @@ func (s *Server) buildRuleEvaluationStatusFromDBEvaluation(
 		Alert:                  buildEvalResultAlertFromLRERow(&eval, efp),
 		Severity:               sev,
 		ReleasePhase:           rp,
+	}
+
+	if includeOutputs && eval.EvalOutput.Valid {
+		res.Output = &structpb.Value{}
+		if err := protojson.Unmarshal(eval.EvalOutput.RawMessage, res.Output); err != nil {
+			return nil, fmt.Errorf("evaluation %s has invalid output: %w", eval.RuleEvaluationID, err)
+		}
 	}
 
 	return res, nil
@@ -816,4 +831,3 @@ func fetchOutputsIfRequested(
 	}
 	return result
 }
-
