@@ -189,8 +189,11 @@ func (s *Server) ListEvaluationHistory(
 		return nil, status.Error(codes.Internal, evalErrMsg)
 	}
 
+	// Batch-fetch outputs if requested
+	outputsByID := fetchOutputsIfRequested(ctx, s.store, in.GetIncludeOutputs(), result.Data)
+
 	// convert data set to proto
-	data, err := fromEvaluationHistoryRows(result.Data)
+	data, err := fromEvaluationHistoryRows(ctx, result.Data, outputsByID)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +223,9 @@ func (s *Server) ListEvaluationHistory(
 }
 
 func fromEvaluationHistoryRows(
+	ctx context.Context,
 	rows []*history.OneEvalHistoryAndEntity,
+	outputsByID map[uuid.UUID]db.EvaluationOutput,
 ) ([]*minderv1.EvaluationHistory, error) {
 	res := make([]*minderv1.EvaluationHistory, len(rows))
 
@@ -236,6 +241,13 @@ func fromEvaluationHistoryRows(
 		evalStatus := &minderv1.EvaluationHistoryStatus{
 			Status:  string(row.EvalHistoryRow.EvaluationStatus),
 			Details: row.EvalHistoryRow.EvaluationDetails,
+		}
+
+		if out, ok := outputsByID[row.EvalHistoryRow.EvaluationID]; ok {
+			evalStatus.Output = &structpb.Value{}
+			if err := protojson.Unmarshal(out.Output.RawMessage, evalStatus.Output); err != nil {
+				zerolog.Ctx(ctx).Error().Err(err).Msg("Unable to unmarshal rule output")
+			}
 		}
 
 		res[i] = &minderv1.EvaluationHistory{
@@ -772,3 +784,35 @@ func dbSeverityToSeverity(dbSev db.Severity) (*minderv1.Severity, error) {
 
 	return severity, nil
 }
+
+// fetchOutputsIfRequested batch-fetches evaluation outputs when
+// includeOutputs is true and there are rows to fetch for.
+func fetchOutputsIfRequested(
+	ctx context.Context,
+	store db.Store,
+	includeOutputs bool,
+	rows []*history.OneEvalHistoryAndEntity,
+) map[uuid.UUID]db.EvaluationOutput {
+	if !includeOutputs || len(rows) == 0 {
+		return nil
+	}
+
+	evalIDs := make([]uuid.UUID, len(rows))
+	for i, row := range rows {
+		evalIDs[i] = row.EvalHistoryRow.EvaluationID
+	}
+
+	outputs, err := store.GetEvaluationOutputsByIDs(ctx, evalIDs)
+	if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error batch-fetching evaluation outputs")
+		return nil
+	}
+
+	result := make(map[uuid.UUID]db.EvaluationOutput, len(outputs))
+	for _, out := range outputs {
+		result[out.ID] = out
+	}
+	return result
+}
+
+
