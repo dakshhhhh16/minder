@@ -244,9 +244,11 @@ func fromEvaluationHistoryRows(
 		}
 
 		if out, ok := outputsByID[row.EvalHistoryRow.EvaluationID]; ok {
-			evalStatus.Output = &structpb.Value{}
-			if err := protojson.Unmarshal(out.Output.RawMessage, evalStatus.Output); err != nil {
-				zerolog.Ctx(ctx).Error().Err(err).Msg("Unable to unmarshal rule output")
+			if out.Output.Valid {
+				evalStatus.Output = &structpb.Value{}
+				if err := protojson.Unmarshal(out.Output.RawMessage, evalStatus.Output); err != nil {
+					zerolog.Ctx(ctx).Error().Err(err).Msg("Unable to unmarshal rule output")
+				}
 			}
 		}
 
@@ -814,5 +816,4 @@ func fetchOutputsIfRequested(
 	}
 	return result
 }
-
 
