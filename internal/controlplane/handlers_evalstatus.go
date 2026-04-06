@@ -15,6 +15,8 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/mindersec/minder/internal/db"
@@ -89,6 +91,18 @@ func (s *Server) GetEvaluationHistory(
 		},
 		Alert:       getAlert(eval.AlertStatus, eval.AlertDetails.String),
 		Remediation: getRemediation(eval.RemediationStatus, eval.RemediationDetails.String),
+	}
+
+	if in.GetIncludeOutputs() {
+		output, err := s.store.GetEvaluationOutput(ctx, eval.EvaluationID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			zerolog.Ctx(ctx).Error().Err(err).Msg("error retrieving evaluation output")
+		} else if err == nil {
+			pbEval.Status.Output = &structpb.Value{}
+			if err := protojson.Unmarshal(output.Output.RawMessage, pbEval.Status.Output); err != nil {
+				zerolog.Ctx(ctx).Error().Err(err).Msg("Unable to unmarshal rule output")
+			}
+		}
 	}
 
 	return &minderv1.GetEvaluationHistoryResponse{Evaluation: pbEval}, nil
@@ -175,8 +189,11 @@ func (s *Server) ListEvaluationHistory(
 		return nil, status.Error(codes.Internal, evalErrMsg)
 	}
 
+	// Batch-fetch outputs if requested
+	outputsByID := fetchOutputsIfRequested(ctx, s.store, in.GetIncludeOutputs(), result.Data)
+
 	// convert data set to proto
-	data, err := fromEvaluationHistoryRows(result.Data)
+	data, err := fromEvaluationHistoryRows(ctx, result.Data, outputsByID)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +223,9 @@ func (s *Server) ListEvaluationHistory(
 }
 
 func fromEvaluationHistoryRows(
+	ctx context.Context,
 	rows []*history.OneEvalHistoryAndEntity,
+	outputsByID map[uuid.UUID]db.EvaluationOutput,
 ) ([]*minderv1.EvaluationHistory, error) {
 	res := make([]*minderv1.EvaluationHistory, len(rows))
 
@@ -222,6 +241,15 @@ func fromEvaluationHistoryRows(
 		evalStatus := &minderv1.EvaluationHistoryStatus{
 			Status:  string(row.EvalHistoryRow.EvaluationStatus),
 			Details: row.EvalHistoryRow.EvaluationDetails,
+		}
+
+		if out, ok := outputsByID[row.EvalHistoryRow.EvaluationID]; ok {
+			if out.Output.Valid {
+				evalStatus.Output = &structpb.Value{}
+				if err := protojson.Unmarshal(out.Output.RawMessage, evalStatus.Output); err != nil {
+					zerolog.Ctx(ctx).Error().Err(err).Msg("Unable to unmarshal rule output")
+				}
+			}
 		}
 
 		res[i] = &minderv1.EvaluationHistory{
@@ -335,12 +363,15 @@ func (s *Server) ListEvaluationResults(
 	// Do the final sort of all the data
 	entities, profileStatuses, statusByEntity, err := s.sortEntitiesEvaluationStatus(
 		ctx, s.store, profileList, profileStatusList, rtIndex, entIdIndex, entTypeIndex,
+		in.GetIncludeOutputs(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("sorting rule evaluations: %w", err)
 	}
 
-	return buildListEvaluationResponse(entities, profileStatuses, statusByEntity), nil
+	resp := buildListEvaluationResponse(entities, profileStatuses, statusByEntity)
+
+	return resp, nil
 }
 
 // sortEntitiesEvaluationStatus queries the database from the filtered lists
@@ -354,6 +385,7 @@ func (s *Server) sortEntitiesEvaluationStatus(
 	profileList []db.ListProfilesByProjectIDAndLabelRow,
 	profileStatusList map[uuid.UUID]db.GetProfileStatusByProjectRow,
 	rtIndex, entIdIndex, entTypeIndex map[string]struct{},
+	includeOutputs bool,
 ) (
 	entities map[string]*minderv1.EntityTypedId,
 	profileStatuses map[uuid.UUID]*minderv1.ProfileStatus,
@@ -371,7 +403,10 @@ func (s *Server) sortEntitiesEvaluationStatus(
 
 	for _, p := range profileList {
 		evals, err := store.ListRuleEvaluationsByProfileId(
-			ctx, db.ListRuleEvaluationsByProfileIdParams{ProfileID: p.Profile.ID},
+			ctx, db.ListRuleEvaluationsByProfileIdParams{
+				ProfileID:      p.Profile.ID,
+				IncludeOutputs: includeOutputs,
+			},
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -424,7 +459,7 @@ func (s *Server) sortEntitiesEvaluationStatus(
 				profileStatuses[p.Profile.ID] = buildProfileStatus(&p, profileStatusList)
 			}
 
-			stat, err := s.buildRuleEvaluationStatusFromDBEvaluation(ctx, &p, e, efp)
+			stat, err := s.buildRuleEvaluationStatusFromDBEvaluation(ctx, &p, e, efp, includeOutputs)
 			if err != nil {
 				// A failure parsing the PR metadata points to a corrupt record. Log but don't err.
 				zerolog.Ctx(ctx).Error().Err(err).Msg("error building rule evaluation status")
@@ -574,6 +609,7 @@ func (s *Server) buildRuleEvaluationStatusFromDBEvaluation(
 	ctx context.Context,
 	profile *db.ListProfilesByProjectIDAndLabelRow, eval db.ListRuleEvaluationsByProfileIdRow,
 	efp *entmodels.EntityWithProperties,
+	includeOutputs bool,
 ) (*minderv1.RuleEvaluationStatus, error) {
 	guidance := ""
 	// Only return the rule type guidance text when there is a problem
@@ -661,6 +697,13 @@ func (s *Server) buildRuleEvaluationStatusFromDBEvaluation(
 		Alert:                  buildEvalResultAlertFromLRERow(&eval, efp),
 		Severity:               sev,
 		ReleasePhase:           rp,
+	}
+
+	if includeOutputs && eval.EvalOutput.Valid {
+		res.Output = &structpb.Value{}
+		if err := protojson.Unmarshal(eval.EvalOutput.RawMessage, res.Output); err != nil {
+			return nil, fmt.Errorf("evaluation %s has invalid output: %w", eval.RuleEvaluationID, err)
+		}
 	}
 
 	return res, nil
@@ -757,4 +800,34 @@ func dbSeverityToSeverity(dbSev db.Severity) (*minderv1.Severity, error) {
 	}
 
 	return severity, nil
+}
+
+// fetchOutputsIfRequested batch-fetches evaluation outputs when
+// includeOutputs is true and there are rows to fetch for.
+func fetchOutputsIfRequested(
+	ctx context.Context,
+	store db.Store,
+	includeOutputs bool,
+	rows []*history.OneEvalHistoryAndEntity,
+) map[uuid.UUID]db.EvaluationOutput {
+	if !includeOutputs || len(rows) == 0 {
+		return nil
+	}
+
+	evalIDs := make([]uuid.UUID, len(rows))
+	for i, row := range rows {
+		evalIDs[i] = row.EvalHistoryRow.EvaluationID
+	}
+
+	outputs, err := store.GetEvaluationOutputsByIDs(ctx, evalIDs)
+	if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error batch-fetching evaluation outputs")
+		return nil
+	}
+
+	result := make(map[uuid.UUID]db.EvaluationOutput, len(outputs))
+	for _, out := range outputs {
+		result[out.ID] = out
+	}
+	return result
 }
