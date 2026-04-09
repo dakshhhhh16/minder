@@ -142,3 +142,81 @@ func TestRegoVersionRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestDetectRegoVersionEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		def  string
+		want ast.RegoVersion
+	}{
+		{
+			name: "v0 function syntax",
+			def: `
+package minder
+
+format_message(difference, format) = msg {
+	format == "json"
+	msg := json.marshal({"items": difference})
+}`,
+			want: ast.RegoV0,
+		},
+		{
+			name: "v1 function syntax",
+			def: `
+package minder
+
+import rego.v1
+
+format_message(difference, format) := msg if {
+	format == "json"
+	msg := json.marshal({"items": difference})
+}`,
+			want: ast.RegoV1,
+		},
+		{
+			name: "v0 partial set with comprehension",
+			def: `
+package minder
+
+violations[{"msg": msg}] {
+	expected_set := {x | x := input.profile.data[_]}
+	input_set := {x | x := input.ingested.data[_]}
+	intersection := expected_set & input_set
+	not count(intersection) == count(input.ingested.data)
+	msg := "sets do not match"
+}`,
+			want: ast.RegoV0,
+		},
+		{
+			name: "v1 every keyword",
+			def: `
+package minder
+
+import rego.v1
+
+default allow := false
+
+allow if {
+	every x in input.ingested.items {
+		x.valid == true
+	}
+}`,
+			want: ast.RegoV1,
+		},
+		{
+			name: "syntax error falls back to v0",
+			def:  "package minder\n\nallow {{{",
+			want: ast.RegoV0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := rego.DetectRegoVersion(tt.def)
+			require.Equal(t, tt.want, got, "DetectRegoVersion() mismatch")
+		})
+	}
+}

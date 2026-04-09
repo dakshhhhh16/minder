@@ -586,3 +586,159 @@ func newDBRuleType(severity db.Severity, subscriptionID uuid.UUID, failureMessag
 		ShortFailureMessage: failureMessage,
 	}
 }
+
+// regoVersionMatcher verifies that RegoVersion in CreateRuleTypeParams or
+// UpdateRuleTypeParams matches the expected value.
+type regoVersionMatcher struct {
+	expected string
+}
+
+func (m regoVersionMatcher) Matches(x interface{}) bool {
+	switch v := x.(type) {
+	case db.CreateRuleTypeParams:
+		return v.RegoVersion == m.expected
+	case db.UpdateRuleTypeParams:
+		return v.RegoVersion == m.expected
+	default:
+		return false
+	}
+}
+
+func (m regoVersionMatcher) String() string {
+	return fmt.Sprintf("has RegoVersion %q", m.expected)
+}
+
+func hasRegoVersion(version string) gomock.Matcher {
+	return regoVersionMatcher{expected: version}
+}
+
+func withRegoEval(regoDef string) func(*pb.RuleType) {
+	return func(ruleType *pb.RuleType) {
+		if ruleType.Def == nil {
+			ruleType.Def = &pb.RuleType_Definition{}
+		}
+		ruleType.Def.Eval = &pb.RuleType_Definition_Eval{
+			Type: "rego",
+			Rego: &pb.RuleType_Definition_Eval_Rego{
+				Type: "deny-by-default",
+				Def:  regoDef,
+			},
+		}
+	}
+}
+
+func withCreateRegoVersionCheck(version string) func(dbf.DBMock) {
+	return func(mock dbf.DBMock) {
+		mock.EXPECT().
+			CreateRuleType(gomock.Any(), hasRegoVersion(version)).
+			Return(expectation, nil)
+	}
+}
+
+func withUpdateRegoVersionCheck(version string) func(dbf.DBMock) {
+	return func(mock dbf.DBMock) {
+		mock.EXPECT().
+			UpdateRuleType(gomock.Any(), hasRegoVersion(version)).
+			Return(expectation, nil)
+	}
+}
+
+const (
+	v0RegoDef = "package minder\n\ndefault allow = false\n\nallow {\n\tinput.ingested.data == \"bar\"\n}"
+	//nolint:lll
+	v1RegoDef = "package minder\n\nimport rego.v1\n\ndefault allow := false\n\nallow if {\n\tinput.ingested.data == \"bar\"\n}"
+)
+
+func TestRuleTypeServiceRegoVersion(t *testing.T) {
+	t.Parallel()
+
+	scenarios := []struct {
+		Name          string
+		RuleType      *pb.RuleType
+		DBSetup       dbf.DBMockBuilder
+		ExpectedError string
+		TestMethod    method
+	}{
+		{
+			Name:     "CreateRuleType detects V0 Rego version",
+			RuleType: newRuleType(withBasicStructure, withRegoEval(v0RegoDef)),
+			DBSetup: dbf.NewDBMock(
+				withHierarchyGet, withNotFoundGet,
+				withCreateRegoVersionCheck("v0"),
+				withSuccessfulDeleteRuleTypeDataSource,
+			),
+			TestMethod: create,
+		},
+		{
+			Name:     "CreateRuleType detects V1 Rego version",
+			RuleType: newRuleType(withBasicStructure, withRegoEval(v1RegoDef)),
+			DBSetup: dbf.NewDBMock(
+				withHierarchyGet, withNotFoundGet,
+				withCreateRegoVersionCheck("v1"),
+				withSuccessfulDeleteRuleTypeDataSource,
+			),
+			TestMethod: create,
+		},
+		{
+			Name:     "CreateRuleType without Rego eval defaults to v0",
+			RuleType: newRuleType(withBasicStructure),
+			DBSetup: dbf.NewDBMock(
+				withHierarchyGet, withNotFoundGet,
+				withCreateRegoVersionCheck("v0"),
+				withSuccessfulDeleteRuleTypeDataSource,
+			),
+			TestMethod: create,
+		},
+		{
+			Name:     "UpdateRuleType detects V0 Rego version",
+			RuleType: newRuleType(withBasicStructure, withRegoEval(v0RegoDef)),
+			DBSetup: dbf.NewDBMock(
+				withHierarchyGet, withSuccessfulGet,
+				withUpdateRegoVersionCheck("v0"),
+				withSuccessfulDeleteRuleTypeDataSource,
+			),
+			TestMethod: update,
+		},
+		{
+			Name:     "UpdateRuleType detects V1 Rego version",
+			RuleType: newRuleType(withBasicStructure, withRegoEval(v1RegoDef)),
+			DBSetup: dbf.NewDBMock(
+				withHierarchyGet, withSuccessfulGet,
+				withUpdateRegoVersionCheck("v1"),
+				withSuccessfulDeleteRuleTypeDataSource,
+			),
+			TestMethod: update,
+		},
+	}
+
+	for _, scenario := range scenarios {
+		t.Run(scenario.Name, func(t *testing.T) {
+			t.Parallel()
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			ctx := context.Background()
+
+			var store db.Store
+			if scenario.DBSetup != nil {
+				store = scenario.DBSetup(ctrl)
+			}
+
+			var err error
+			svc := ruletypes.NewRuleTypeService()
+			switch scenario.TestMethod {
+			case create:
+				_, err = svc.CreateRuleType(ctx, projectID, uuid.Nil, scenario.RuleType, store)
+			case update:
+				_, err = svc.UpdateRuleType(ctx, projectID, uuid.Nil, scenario.RuleType, store)
+			case upsert:
+				t.Fatal("upsert not tested in this suite")
+			}
+
+			if scenario.ExpectedError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, scenario.ExpectedError)
+			}
+		})
+	}
+}

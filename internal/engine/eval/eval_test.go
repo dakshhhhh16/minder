@@ -9,7 +9,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/mindersec/minder/internal/engine/eval"
 	"github.com/mindersec/minder/internal/engine/eval/rego"
@@ -184,4 +186,106 @@ func TestNewRuleEvaluatorFails(t *testing.T) {
 			assert.Nil(t, got, "should be nil")
 		})
 	}
+}
+
+func TestRegoV1PolicyEvaluation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		def         string
+		evalType    string
+		regoVersion ast.RegoVersion
+		wantErr     bool
+	}{
+		{
+			name: "V1 deny-by-default policy evaluates with V1 version",
+			def: "package minder\n\nimport rego.v1\n\ndefault allow := false\n\n" +
+				"allow if {\n\tinput.ingested.data == \"bar\"\n}",
+			evalType:    rego.DenyByDefaultEvaluationType.String(),
+			regoVersion: ast.RegoV1,
+			wantErr:     true, // data != "bar"
+		},
+		{
+			name: "V1 constraints policy evaluates with V1 version",
+			def: "package minder\n\nimport rego.v1\n\n" +
+				"violations contains {\"msg\": msg} if {\n\tinput.ingested.data == \"foo\"\n\tmsg := \"data is foo\"\n}",
+			evalType:    rego.ConstraintsEvaluationType.String(),
+			regoVersion: ast.RegoV1,
+			wantErr:     true, // violation triggered
+		},
+		{
+			name:        "V0 policy still works with V0 version option",
+			def:         "package minder\n\ndefault allow = false\n\nallow {\n\tinput.ingested.data == \"bar\"\n}",
+			evalType:    rego.DenyByDefaultEvaluationType.String(),
+			regoVersion: ast.RegoV0,
+			wantErr:     true, // data != "bar"
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rt := &pb.RuleType{
+				Def: &pb.RuleType_Definition{
+					Eval: &pb.RuleType_Definition_Eval{
+						Type: "rego",
+						Rego: &pb.RuleType_Definition_Eval_Rego{
+							Type: tt.evalType,
+							Def:  tt.def,
+						},
+					},
+				},
+			}
+
+			got, err := eval.NewRuleEvaluator(
+				context.Background(), rt, nil,
+				rego.WithRegoVersion(tt.regoVersion),
+			)
+			require.NoError(t, err, "should create evaluator")
+			require.NotNil(t, got, "evaluator should not be nil")
+
+			profileData := map[string]any{"data": "nothing"}
+			data := &interfaces.Ingested{
+				Object: map[string]any{"data": "foo"},
+			}
+			_, err = got.Eval(context.Background(), profileData, nil, data)
+			if tt.wantErr {
+				assert.Error(t, err, "expected evaluation failure")
+			} else {
+				assert.NoError(t, err, "expected evaluation success")
+			}
+		})
+	}
+}
+
+func TestRegoV1PolicySucceeds(t *testing.T) {
+	t.Parallel()
+
+	rt := &pb.RuleType{
+		Def: &pb.RuleType_Definition{
+			Eval: &pb.RuleType_Definition_Eval{
+				Type: "rego",
+				Rego: &pb.RuleType_Definition_Eval_Rego{
+					Type: rego.DenyByDefaultEvaluationType.String(),
+					Def: "package minder\n\nimport rego.v1\n\ndefault allow := false\n\n" +
+						"allow if {\n\tinput.ingested.data == \"foo\"\n}",
+				},
+			},
+		},
+	}
+
+	got, err := eval.NewRuleEvaluator(
+		context.Background(), rt, nil,
+		rego.WithRegoVersion(ast.RegoV1),
+	)
+	require.NoError(t, err)
+
+	profileData := map[string]any{"data": "nothing"}
+	data := &interfaces.Ingested{
+		Object: map[string]any{"data": "foo"},
+	}
+	_, err = got.Eval(context.Background(), profileData, nil, data)
+	require.NoError(t, err, "V1 policy should allow when data matches")
 }
