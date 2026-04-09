@@ -313,7 +313,7 @@ func TestRuleType_Definition_Eval_Rego_Validate(t *testing.T) {
 			rego: &RuleType_Definition_Eval_Rego{
 				Def: "package example.policy\n\nallow if { input.ingested.url != \"\" }",
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 	}
 

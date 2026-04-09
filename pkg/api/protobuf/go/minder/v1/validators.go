@@ -251,9 +251,14 @@ func (rego *RuleType_Definition_Eval_Rego) Validate() error {
 		return fmt.Errorf("%w: rego definition is empty", ErrInvalidRuleTypeDefinition)
 	}
 
-	// TODO: figure out a Rego V1 migration path (https://github.com/mindersec/minder/issues/5262)
+	// Try parsing as Rego V1 first; if that fails, fall back to V0.
+	// This allows both V0 and V1 policies to pass validation.
 	_, err := ast.ParseModuleWithOpts("minder-ruletype-def.rego", rego.Def,
-		ast.ParserOptions{RegoVersion: ast.RegoV0})
+		ast.ParserOptions{RegoVersion: ast.RegoV1})
+	if err != nil {
+		_, err = ast.ParseModuleWithOpts("minder-ruletype-def.rego", rego.Def,
+			ast.ParserOptions{RegoVersion: ast.RegoV0})
+	}
 	if err != nil {
 		return fmt.Errorf("%w: rego definition is invalid: %s", ErrInvalidRuleTypeDefinition, err)
 	}

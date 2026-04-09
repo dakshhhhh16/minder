@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mindersec/minder/internal/db"
+	regoeval "github.com/mindersec/minder/internal/engine/eval/rego"
 	"github.com/mindersec/minder/internal/logger"
 	"github.com/mindersec/minder/internal/marketplaces/namespaces"
 	"github.com/mindersec/minder/internal/util"
@@ -156,6 +157,7 @@ func (*ruleTypeService) CreateRuleType(
 		SeverityValue:       *severity,
 		SubscriptionID:      uuid.NullUUID{UUID: subscriptionID, Valid: subscriptionID != uuid.Nil},
 		ReleasePhase:        *releasePhase,
+		RegoVersion:         detectRegoVersionFromRuleType(ruleType),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rule type: %w", err)
@@ -243,6 +245,7 @@ func (*ruleTypeService) UpdateRuleType(
 		DisplayName:         ruleType.GetDisplayName(),
 		ShortFailureMessage: ruleType.GetShortFailureMessage(),
 		ReleasePhase:        *releasePhase,
+		RegoVersion:         detectRegoVersionFromRuleType(ruleType),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to update rule type: %w", err)
@@ -399,4 +402,16 @@ func getAvailableDataSources(
 	}
 
 	return datasources, nil
+}
+
+// detectRegoVersionFromRuleType inspects the rule type's Rego definition
+// and returns the detected version string ("v0" or "v1") for storage in
+// the database. If the rule type does not use Rego evaluation, it returns
+// "v0" as a safe default.
+func detectRegoVersionFromRuleType(ruleType *pb.RuleType) string {
+	regoDef := ruleType.GetDef().GetEval().GetRego().GetDef()
+	if regoDef == "" {
+		return "v0"
+	}
+	return regoeval.VersionToString(regoeval.DetectRegoVersion(regoDef))
 }
